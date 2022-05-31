@@ -73,3 +73,11 @@ def initalize(context):
                         date_rule = date_rules.every_day(),
                         time_rule = time_rules.market_close(minutes=5)
     )
+
+
+def retrain_model(context, data):
+    """
+        A function to retrain the regression. This function is called by the 
+        schedule_function in the initialize function.
+    """
+    context.retrain_flag = True 
