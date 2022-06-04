@@ -14,6 +14,7 @@
 """
 
 # Machine learning libraries
+from curses import window
 from os import times_result
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
@@ -81,3 +82,119 @@ def retrain_model(context, data):
         schedule_function in the initialize function.
     """
     context.retrain_flag = True 
+
+
+def rebalance(context, data):
+    """
+        A function to rebalance the portfolio. This function is called by the 
+        schedule_function in the initialize function.
+    """
+
+    # Fetch lookback no. days data for the security
+    try:
+        Df = data.history(
+            context.security,
+            ['open','high','low', 'close'],
+            context.lookback + 1,
+            '1d'
+        )
+    except IndexError:
+        return
+
+    # Calculate short moving average of close prices
+    Df['S_short'] = Df['close'].shift(1).rolling(
+        window=context.MA_lookback_short).mean()
+
+    # Calculate medium moving average of close prices
+    Df['S_medium'] = Df['close'].shift(1).rolling(
+        window=context.MA_lookback_medium).mean()
+
+    # Calculate long moving average of close prices
+    Df['S_long'] = Df['close'].shift(1).rolling(
+        window=context.MA_lookback_long).mean()
+
+    # Calculate the correlation between close price and short moving average
+    Df['Corr'] = Df['close'].shift(1).rolling(
+        window=context.correl_lookback).corr(Df['S_short'].shift(1))
+
+    Df['Std_U'] = Df['high'] - Df['open']
+    Df['Std_D'] = Df['open'] - Df['low']
+
+    Df['OD'] = Df['open'] - Df['open'].shift(1)
+    Df['OL'] = Df['open'] - Df['close'].shift(1)
+    Df.dropna(inplace=True)
+
+    X_U = Df[['open', 'S_short', 'S_medium', 'S_long', 'OD', 'OL', 'Corr']]
+    X_D = X_U
+    yU = Df['Std_U']
+    yD = Df['Std_D']
+
+    # Calculate the split ratio
+    t = context.split_ratio
+    split = int(t*len(Df))
+
+    if context.retrain_flag:
+        context.retrain_flag = False 
+        steps = [('scaler', StandardScaler()), 
+                 ('linear', LinearRegression())]
+        
+        pipeline = Pipeline(steps)
+        parameters = {'linear_fit_intercept':[0,1]}
+
+        context.reg_U = GridSearchCV(pipeline, parameters, cv=5)
+        context.reg_U.fit(X_U[:split], yU[:split])
+        best_fit_U = context.reg_U.best_params_['linear__fit_intercept']
+        context.reg_U = LinearRegression(fit_intercept=best_fit_U)
+        context.reg_U.fit(X_U[:split], yU[:split])
+
+        context.reg_D = GridSearchCV(pipeline, parameters, cv=5)
+        context.reg_D.fit(X_D[:split], yD[:split])
+        best_fit_D = context.reg_D.best_params_['linear__fit_intercept']
+        context.reg_D = LinearRegression(fit_intercept=best_fit_D)
+        context.reg_D.fit(X_D[:split], yD[:split])
+
+    yU_predict = context.reg_U.predict(X_U[split:])
+    # Assign the predicted values to a new column in the dataframe
+    Df.reset_index(inplace=True)
+    Df['Max_U'] = 0 
+    Df.loc[Df.index >= split, 'Max_U'] = yU_predict 
+    Df.loc[Df['Max_U'] < 0, 'Max_U'] = 0
+
+    yD_predict = context.reg_D.predict(X_D[split:])
+    # Assign the predicted values to a new column in the data frame
+    Df['Max_D'] = 0
+    Df.loc[Df.index >= split, 'Max_D'] = yD_predict 
+    Df.loc[Df['Max_D'] < 0, 'Max_D'] = 0
+
+    # Use the predicted upside deviation values to calculate the high price
+    Df['P_H'] = Df['open'] + Df['Max_U']
+    Df['P_L'] = Df['open'] - Df['Max_D']
+
+    context.accuracy = len(
+        Df[(Df['P_H'] >= Df['high']) & 
+        (Df['P_L'] <= Df['low'])]) * 1.0 / len(X_U[split:])
+
+    # Trading signal
+    sell_sig = list((Df['high'] > Df['P_H']) & (Df['low'] > Df['P_L']))[-1]
+    buy_sig  = list((Df['high'] < Df['P_H']) & (Df['low'] < Df['P_L']))[-1]
+
+    # Long, short and exit conditions
+    long_entry = buy_sig and context.accuracy > 0.3
+    short_entry = sell_sig and context.accuracy > 0.3
+    exit_position = context.accuracy < 0.3
+
+    # Place the orders
+    if long_entry:
+        print("{} Long entry condition is {}".format(get_datetime(), long_entry))
+        print("{} Going long in: {}".format(get_datetime(), context.security.symbol))
+        order_target_percent(context.security, 1)
+
+    elif short_entry:
+        print("{} Short entry condition is {}".format(get_datetime(), short_entry))
+        print("{} Going short in: {}".format(get_datetime(), context.security.symbol))
+        order_target_percent(context.security, -1)
+
+    elif exit_position:
+        order_target_percent(context.security, 0)
+
+    
